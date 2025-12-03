@@ -3,6 +3,8 @@
 
 #include <esp_log.h>
 #include <driver/ledc.h>
+#include <cstdlib>
+#include <algorithm>
 
 #define TAG "Backlight"
 
@@ -58,13 +60,24 @@ void Backlight::SetBrightness(uint8_t brightness, bool permanent) {
     }
 
     target_brightness_ = brightness;
-    step_ = (target_brightness_ > brightness_) ? 1 : -1;
+
+    // 优化：计算合适的步长，使渐变总时间约为 300ms
+    // 使用 20ms 间隔代替 5ms，减少 CPU 唤醒次数
+    int diff = abs(static_cast<int>(target_brightness_) - static_cast<int>(brightness_));
+    if (diff > 0) {
+        // 目标：约 15 步完成渐变（300ms / 20ms = 15）
+        step_ = (target_brightness_ > brightness_) ?
+                std::max(1, diff / 15) :
+                -std::max(1, diff / 15);
+    } else {
+        step_ = (target_brightness_ > brightness_) ? 1 : -1;
+    }
 
     if (transition_timer_ != nullptr) {
-        // 启动定时器，每 5ms 更新一次
-        esp_timer_start_periodic(transition_timer_, 5 * 1000);
+        // 使用 20ms 间隔代替 5ms，减少 75% 的 CPU 唤醒
+        esp_timer_start_periodic(transition_timer_, 20 * 1000);
     }
-    ESP_LOGI(TAG, "Set brightness to %d", brightness);
+    ESP_LOGI(TAG, "Set brightness to %d (step: %d)", brightness, step_);
 }
 
 void Backlight::OnTransitionTimer() {
@@ -73,7 +86,24 @@ void Backlight::OnTransitionTimer() {
         return;
     }
 
-    brightness_ += step_;
+    // 使用可变步长，确保不会越过目标值
+    int new_brightness = static_cast<int>(brightness_) + step_;
+    if (step_ > 0) {
+        // 增加亮度
+        if (new_brightness >= target_brightness_) {
+            brightness_ = target_brightness_;
+        } else {
+            brightness_ = static_cast<uint8_t>(new_brightness);
+        }
+    } else {
+        // 减少亮度
+        if (new_brightness <= target_brightness_) {
+            brightness_ = target_brightness_;
+        } else {
+            brightness_ = static_cast<uint8_t>(new_brightness);
+        }
+    }
+
     SetBrightnessImpl(brightness_);
 
     if (brightness_ == target_brightness_) {

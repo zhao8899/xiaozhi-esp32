@@ -272,6 +272,9 @@ void Application::ToggleChatState() {
             if (!protocol_->IsAudioChannelOpened()) {
                 SetDeviceState(kDeviceStateConnecting);
                 if (!protocol_->OpenAudioChannel()) {
+                    // 连接失败，回滚状态到Idle，避免状态卡死
+                    ESP_LOGW(TAG, "OpenAudioChannel失败，回滚状态到Idle");
+                    SetDeviceState(kDeviceStateIdle);
                     return;
                 }
             }
@@ -309,6 +312,9 @@ void Application::StartListening() {
             if (!protocol_->IsAudioChannelOpened()) {
                 SetDeviceState(kDeviceStateConnecting);
                 if (!protocol_->OpenAudioChannel()) {
+                    // 连接失败，回滚状态到Idle，避免状态卡死
+                    ESP_LOGW(TAG, "OpenAudioChannel失败，回滚状态到Idle");
+                    SetDeviceState(kDeviceStateIdle);
                     return;
                 }
             }
@@ -381,8 +387,9 @@ void Application::Start() {
         vTaskDelete(NULL);
     }, "main_event_loop", 2048 * 4, this, 3, &main_event_loop_task_handle_);
 
-    /* Start the clock timer to update the status bar */
-    esp_timer_start_periodic(clock_timer_handle_, 1000000);
+    /* Start the clock timer to update the status bar
+     * 从1秒改为5秒，减少不必要的CPU唤醒，节省功耗 */
+    esp_timer_start_periodic(clock_timer_handle_, 5000000);
 
     /* Wait for the network to be ready */
     board.StartNetwork();
@@ -550,6 +557,11 @@ void Application::Start() {
 void Application::Schedule(std::function<void()> callback) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        // 检查队列大小，防止内存耗尽
+        if (main_tasks_.size() >= MAX_MAIN_TASKS_QUEUE_SIZE) {
+            ESP_LOGW(TAG, "主任务队列已满(%d)，丢弃新任务", MAX_MAIN_TASKS_QUEUE_SIZE);
+            return;
+        }
         main_tasks_.push_back(std::move(callback));
     }
     xEventGroupSetBits(event_group_, MAIN_EVENT_SCHEDULE);
@@ -626,6 +638,9 @@ void Application::OnWakeWordDetected() {
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             if (!protocol_->OpenAudioChannel()) {
+                // 连接失败，回滚状态到Idle，重新启用唤醒词检测
+                ESP_LOGW(TAG, "OpenAudioChannel失败，回滚状态到Idle");
+                SetDeviceState(kDeviceStateIdle);
                 audio_service_.EnableWakeWordDetection(true);
                 return;
             }
@@ -801,6 +816,9 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             if (!protocol_->OpenAudioChannel()) {
+                // 连接失败，回滚状态到Idle，重新启用唤醒词检测
+                ESP_LOGW(TAG, "OpenAudioChannel失败，回滚状态到Idle");
+                SetDeviceState(kDeviceStateIdle);
                 audio_service_.EnableWakeWordDetection(true);
                 return;
             }

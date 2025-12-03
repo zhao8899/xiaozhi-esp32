@@ -184,10 +184,14 @@ void MqttProtocol::CloseAudioChannel() {
         udp_.reset();
     }
 
-    std::string message = "{";
-    message += "\"session_id\":\"" + session_id_ + "\",";
-    message += "\"type\":\"goodbye\"";
-    message += "}";
+    // 使用 cJSON 安全构建 JSON，防止注入攻击
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "session_id", session_id_.c_str());
+    cJSON_AddStringToObject(root, "type", "goodbye");
+    char* json_str = cJSON_PrintUnformatted(root);
+    std::string message(json_str);
+    cJSON_free(json_str);
+    cJSON_Delete(root);
     SendText(message);
 
     if (on_audio_channel_closed_ != nullptr) {
@@ -304,8 +308,12 @@ std::string MqttProtocol::GetHelloMessage() {
 
 void MqttProtocol::ParseServerHello(const cJSON* root) {
     auto transport = cJSON_GetObjectItem(root, "transport");
-    if (transport == nullptr || strcmp(transport->valuestring, "udp") != 0) {
-        ESP_LOGE(TAG, "Unsupported transport: %s", transport->valuestring);
+    if (transport == nullptr || !cJSON_IsString(transport)) {
+        ESP_LOGE(TAG, "transport字段缺失或无效");
+        return;
+    }
+    if (strcmp(transport->valuestring, "udp") != 0) {
+        ESP_LOGE(TAG, "不支持的transport类型: %s", transport->valuestring);
         return;
     }
 
@@ -315,36 +323,83 @@ void MqttProtocol::ParseServerHello(const cJSON* root) {
         ESP_LOGI(TAG, "Session ID: %s", session_id_.c_str());
     }
 
-    // Get sample rate from hello message
+    // Get sample rate from hello message with range validation
     auto audio_params = cJSON_GetObjectItem(root, "audio_params");
     if (cJSON_IsObject(audio_params)) {
         auto sample_rate = cJSON_GetObjectItem(audio_params, "sample_rate");
         if (cJSON_IsNumber(sample_rate)) {
-            server_sample_rate_ = sample_rate->valueint;
+            int rate = sample_rate->valueint;
+            // 验证采样率范围: 8000-48000 Hz
+            if (rate >= 8000 && rate <= 48000) {
+                server_sample_rate_ = rate;
+            } else {
+                ESP_LOGW(TAG, "采样率超出有效范围(%d)，使用默认值", rate);
+            }
         }
         auto frame_duration = cJSON_GetObjectItem(audio_params, "frame_duration");
         if (cJSON_IsNumber(frame_duration)) {
-            server_frame_duration_ = frame_duration->valueint;
+            int duration = frame_duration->valueint;
+            // 验证帧时长范围: 10-120 ms (Opus 支持的范围)
+            if (duration >= 10 && duration <= 120) {
+                server_frame_duration_ = duration;
+            } else {
+                ESP_LOGW(TAG, "帧时长超出有效范围(%d)，使用默认值", duration);
+            }
         }
     }
 
     auto udp = cJSON_GetObjectItem(root, "udp");
     if (!cJSON_IsObject(udp)) {
-        ESP_LOGE(TAG, "UDP is not specified");
+        ESP_LOGE(TAG, "UDP配置缺失");
         return;
     }
-    udp_server_ = cJSON_GetObjectItem(udp, "server")->valuestring;
-    udp_port_ = cJSON_GetObjectItem(udp, "port")->valueint;
-    auto key = cJSON_GetObjectItem(udp, "key")->valuestring;
-    auto nonce = cJSON_GetObjectItem(udp, "nonce")->valuestring;
 
-    // auto encryption = cJSON_GetObjectItem(udp, "encryption")->valuestring;
-    // ESP_LOGI(TAG, "UDP server: %s, port: %d, encryption: %s", udp_server_.c_str(), udp_port_, encryption);
-    aes_nonce_ = DecodeHexString(nonce);
-    mbedtls_aes_init(&aes_ctx_);
-    mbedtls_aes_setkey_enc(&aes_ctx_, (const unsigned char*)DecodeHexString(key).c_str(), 128);
-    local_sequence_ = 0;
-    remote_sequence_ = 0;
+    // 安全获取UDP配置字段，检查空指针
+    auto server_item = cJSON_GetObjectItem(udp, "server");
+    auto port_item = cJSON_GetObjectItem(udp, "port");
+    auto key_item = cJSON_GetObjectItem(udp, "key");
+    auto nonce_item = cJSON_GetObjectItem(udp, "nonce");
+
+    if (!cJSON_IsString(server_item) || !cJSON_IsNumber(port_item) ||
+        !cJSON_IsString(key_item) || !cJSON_IsString(nonce_item)) {
+        ESP_LOGE(TAG, "UDP配置字段不完整: server=%d, port=%d, key=%d, nonce=%d",
+                 cJSON_IsString(server_item), cJSON_IsNumber(port_item),
+                 cJSON_IsString(key_item), cJSON_IsString(nonce_item));
+        return;
+    }
+
+    // 先提取字符串值，避免在锁内做复杂操作
+    std::string server = server_item->valuestring;
+    int port = port_item->valueint;
+    const char* key = key_item->valuestring;
+    const char* nonce = nonce_item->valuestring;
+
+    // 解码密钥和nonce
+    std::string decoded_key = DecodeHexString(key);
+    std::string decoded_nonce = DecodeHexString(nonce);
+
+    // 验证密钥和nonce长度
+    if (decoded_key.size() < 16 || decoded_nonce.size() < 16) {
+        ESP_LOGE(TAG, "密钥或nonce长度无效: key=%zu, nonce=%zu",
+                 decoded_key.size(), decoded_nonce.size());
+        return;
+    }
+
+    {
+        // 使用锁保护加密相关数据的写入，防止与 SendAudio 的竞态条件
+        std::lock_guard<std::mutex> lock(channel_mutex_);
+        udp_server_ = server;
+        udp_port_ = port;
+        aes_nonce_ = decoded_nonce;
+        mbedtls_aes_init(&aes_ctx_);
+        mbedtls_aes_setkey_enc(&aes_ctx_, (const unsigned char*)decoded_key.c_str(), 128);
+
+        // 使用随机初始序列号防止跨会话的nonce重用
+        // 每个会话服务器都会提供新的key/nonce，但增加随机起始点作为额外安全层
+        local_sequence_ = esp_random() & 0x00FFFFFF;  // 使用24位随机数，保留高位给递增空间
+        remote_sequence_ = 0;
+    }
+    ESP_LOGI(TAG, "AES加密初始化完成，初始序列号=%lu", local_sequence_);
     xEventGroupSetBits(event_group_handle_, MQTT_PROTOCOL_SERVER_HELLO_EVENT);
 }
 
@@ -359,8 +414,14 @@ static inline uint8_t CharToHex(char c) {
 
 std::string MqttProtocol::DecodeHexString(const std::string& hex_string) {
     std::string decoded;
+    // 检查输入有效性：必须是偶数长度
+    if (hex_string.empty() || (hex_string.size() % 2) != 0) {
+        ESP_LOGW(TAG, "无效的十六进制字符串，长度=%zu", hex_string.size());
+        return decoded;
+    }
+
     decoded.reserve(hex_string.size() / 2);
-    for (size_t i = 0; i < hex_string.size(); i += 2) {
+    for (size_t i = 0; i + 1 < hex_string.size(); i += 2) {
         char byte = (CharToHex(hex_string[i]) << 4) | CharToHex(hex_string[i + 1]);
         decoded.push_back(byte);
     }

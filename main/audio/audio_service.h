@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <mutex>
+#include <atomic>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -132,6 +133,8 @@ private:
     TaskHandle_t opus_codec_task_handle_ = nullptr;
     std::mutex audio_queue_mutex_;
     std::condition_variable audio_queue_cv_;
+    std::mutex codec_mutex_;  // 保护 opus_decoder_ 和 resampler_ 的访问
+    std::mutex init_mutex_;   // 保护初始化操作
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_decode_queue_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_send_queue_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_testing_queue_;
@@ -140,9 +143,9 @@ private:
     // For server AEC
     std::deque<uint32_t> timestamp_queue_;
 
-    bool wake_word_initialized_ = false;
-    bool audio_processor_initialized_ = false;
-    bool voice_detected_ = false;
+    std::atomic<bool> wake_word_initialized_{false};
+    std::atomic<bool> audio_processor_initialized_{false};
+    std::atomic<bool> voice_detected_{false};
     bool service_stopped_ = true;
     bool audio_input_need_warmup_ = false;
 

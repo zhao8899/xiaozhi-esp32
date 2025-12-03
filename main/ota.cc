@@ -46,6 +46,12 @@ std::string Ota::GetCheckVersionUrl() {
     if (url.empty()) {
         url = CONFIG_OTA_URL;
     }
+
+    // 安全检查：强制使用 HTTPS
+    if (url.substr(0, 7) == "http://") {
+        ESP_LOGW(TAG, "检测到不安全的 http:// 连接，自动升级为 https://");
+        url = "https://" + url.substr(7);
+    }
     return url;
 }
 
@@ -59,7 +65,8 @@ std::unique_ptr<Http> Ota::SetupHttp() {
     http->SetHeader("Client-Id", board.GetUuid());
     if (has_serial_number_) {
         http->SetHeader("Serial-Number", serial_number_.c_str());
-        ESP_LOGI(TAG, "Setup HTTP, User-Agent: %s, Serial-Number: %s", user_agent.c_str(), serial_number_.c_str());
+        // 不记录完整的序列号，仅记录长度以保护敏感信息
+        ESP_LOGI(TAG, "Setup HTTP, User-Agent: %s, Serial-Number: [长度=%zu]", user_agent.c_str(), serial_number_.size());
     }
     http->SetHeader("User-Agent", user_agent);
     http->SetHeader("Accept-Language", Lang::CODE);

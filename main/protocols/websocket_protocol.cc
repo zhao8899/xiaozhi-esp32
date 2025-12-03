@@ -14,9 +14,28 @@
 
 WebsocketProtocol::WebsocketProtocol() {
     event_group_handle_ = xEventGroupCreate();
+
+    // 初始化重连定时器
+    esp_timer_create_args_t reconnect_timer_args = {
+        .callback = [](void* arg) {
+            WebsocketProtocol* protocol = (WebsocketProtocol*)arg;
+            protocol->reconnect_scheduled_ = false;
+            ESP_LOGI(TAG, "WebSocket重连定时器触发");
+            // 重连逻辑会在下次 OpenAudioChannel 时自动处理
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "ws_reconnect",
+        .skip_unhandled_events = true
+    };
+    esp_timer_create(&reconnect_timer_args, &reconnect_timer_);
 }
 
 WebsocketProtocol::~WebsocketProtocol() {
+    if (reconnect_timer_ != nullptr) {
+        esp_timer_stop(reconnect_timer_);
+        esp_timer_delete(reconnect_timer_);
+    }
     vEventGroupDelete(event_group_handle_);
 }
 
@@ -63,7 +82,8 @@ bool WebsocketProtocol::SendText(const std::string& text) {
     }
 
     if (!websocket_->Send(text)) {
-        ESP_LOGE(TAG, "Failed to send text: %s", text.c_str());
+        // 不记录完整文本内容，可能包含敏感信息
+        ESP_LOGE(TAG, "发送文本失败，长度: %zu", text.size());
         SetError(Lang::Strings::SERVER_ERROR);
         return false;
     }
@@ -79,7 +99,7 @@ void WebsocketProtocol::CloseAudioChannel() {
     websocket_.reset();
 }
 
-bool WebsocketProtocol::OpenAudioChannel() {
+bool WebsocketProtocol::TryConnect() {
     Settings settings("websocket", false);
     std::string url = settings.GetString("url");
     std::string token = settings.GetString("token");
@@ -88,12 +108,20 @@ bool WebsocketProtocol::OpenAudioChannel() {
         version_ = version;
     }
 
-    error_occurred_ = false;
+    // 安全检查：强制使用 WSS 加密连接
+    if (url.substr(0, 5) == "ws://") {
+        ESP_LOGW(TAG, "检测到不安全的 ws:// 连接，自动升级为 wss://");
+        url = "wss://" + url.substr(5);
+    } else if (url.substr(0, 6) != "wss://") {
+        ESP_LOGE(TAG, "无效的 WebSocket URL，必须使用 wss:// 协议");
+        SetError(Lang::Strings::SERVER_NOT_FOUND);
+        return false;
+    }
 
     auto network = Board::GetInstance().GetNetwork();
     websocket_ = network->CreateWebSocket(1);
     if (websocket_ == nullptr) {
-        ESP_LOGE(TAG, "Failed to create websocket");
+        ESP_LOGE(TAG, "创建WebSocket失败");
         return false;
     }
 
@@ -108,15 +136,71 @@ bool WebsocketProtocol::OpenAudioChannel() {
     websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
     websocket_->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
 
+    // 不记录完整 URL，可能包含敏感参数
+    ESP_LOGI(TAG, "连接 WebSocket 服务器 (版本: %d)", version_);
+    if (!websocket_->Connect(url.c_str())) {
+        ESP_LOGE(TAG, "WebSocket连接失败, code=%d", websocket_->GetLastError());
+        websocket_.reset();
+        return false;
+    }
+    return true;
+}
+
+void WebsocketProtocol::ScheduleReconnect() {
+    if (!reconnect_scheduled_ && connect_retry_count_ < WEBSOCKET_MAX_CONNECT_RETRIES) {
+        reconnect_scheduled_ = true;
+        esp_timer_start_once(reconnect_timer_, WEBSOCKET_RECONNECT_INTERVAL_MS * 1000);
+        ESP_LOGI(TAG, "WebSocket将在%d秒后重连 (重试 %d/%d)",
+                 WEBSOCKET_RECONNECT_INTERVAL_MS / 1000,
+                 connect_retry_count_ + 1, WEBSOCKET_MAX_CONNECT_RETRIES);
+    }
+}
+
+bool WebsocketProtocol::OpenAudioChannel() {
+    error_occurred_ = false;
+    connect_retry_count_ = 0;
+
+    // 尝试连接，最多重试 WEBSOCKET_MAX_CONNECT_RETRIES 次
+    while (connect_retry_count_ < WEBSOCKET_MAX_CONNECT_RETRIES) {
+        if (TryConnect()) {
+            break;
+        }
+        connect_retry_count_++;
+        if (connect_retry_count_ < WEBSOCKET_MAX_CONNECT_RETRIES) {
+            ESP_LOGW(TAG, "WebSocket连接失败，立即重试 (%d/%d)",
+                     connect_retry_count_, WEBSOCKET_MAX_CONNECT_RETRIES);
+            vTaskDelay(pdMS_TO_TICKS(1000));  // 短暂延迟后重试
+        }
+    }
+
+    if (websocket_ == nullptr) {
+        ESP_LOGE(TAG, "WebSocket连接失败，已重试%d次", WEBSOCKET_MAX_CONNECT_RETRIES);
+        SetError(Lang::Strings::SERVER_NOT_CONNECTED);
+        return false;
+    }
+
     websocket_->OnData([this](const char* data, size_t len, bool binary) {
         if (binary) {
             if (on_incoming_audio_ != nullptr) {
                 if (version_ == 2) {
+                    // 检查数据长度是否足够包含协议头
+                    if (len < sizeof(BinaryProtocol2)) {
+                        ESP_LOGE(TAG, "数据包太短，无法解析v2协议头: len=%zu", len);
+                        return;
+                    }
                     BinaryProtocol2* bp2 = (BinaryProtocol2*)data;
                     bp2->version = ntohs(bp2->version);
                     bp2->type = ntohs(bp2->type);
                     bp2->timestamp = ntohl(bp2->timestamp);
                     bp2->payload_size = ntohl(bp2->payload_size);
+
+                    // 验证payload_size不超过实际数据长度
+                    size_t max_payload = len - sizeof(BinaryProtocol2);
+                    if (bp2->payload_size > max_payload) {
+                        ESP_LOGE(TAG, "payload_size(%u)超过可用数据(%zu)", bp2->payload_size, max_payload);
+                        return;
+                    }
+
                     auto payload = (uint8_t*)bp2->payload;
                     on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
                         .sample_rate = server_sample_rate_,
@@ -125,9 +209,22 @@ bool WebsocketProtocol::OpenAudioChannel() {
                         .payload = std::vector<uint8_t>(payload, payload + bp2->payload_size)
                     }));
                 } else if (version_ == 3) {
+                    // 检查数据长度是否足够包含协议头
+                    if (len < sizeof(BinaryProtocol3)) {
+                        ESP_LOGE(TAG, "数据包太短，无法解析v3协议头: len=%zu", len);
+                        return;
+                    }
                     BinaryProtocol3* bp3 = (BinaryProtocol3*)data;
                     bp3->type = bp3->type;
                     bp3->payload_size = ntohs(bp3->payload_size);
+
+                    // 验证payload_size不超过实际数据长度
+                    size_t max_payload = len - sizeof(BinaryProtocol3);
+                    if (bp3->payload_size > max_payload) {
+                        ESP_LOGE(TAG, "payload_size(%u)超过可用数据(%zu)", bp3->payload_size, max_payload);
+                        return;
+                    }
+
                     auto payload = (uint8_t*)bp3->payload;
                     on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
                         .sample_rate = server_sample_rate_,
@@ -147,6 +244,10 @@ bool WebsocketProtocol::OpenAudioChannel() {
         } else {
             // Parse JSON data
             auto root = cJSON_Parse(data);
+            if (root == nullptr) {
+                ESP_LOGE(TAG, "JSON解析失败，数据: %.100s", data);
+                return;
+            }
             auto type = cJSON_GetObjectItem(root, "type");
             if (cJSON_IsString(type)) {
                 if (strcmp(type->valuestring, "hello") == 0) {
@@ -157,7 +258,7 @@ bool WebsocketProtocol::OpenAudioChannel() {
                     }
                 }
             } else {
-                ESP_LOGE(TAG, "Missing message type, data: %s", data);
+                ESP_LOGE(TAG, "缺少消息类型字段，数据: %.100s", data);
             }
             cJSON_Delete(root);
         }
@@ -171,13 +272,7 @@ bool WebsocketProtocol::OpenAudioChannel() {
         }
     });
 
-    ESP_LOGI(TAG, "Connecting to websocket server: %s with version: %d", url.c_str(), version_);
-    if (!websocket_->Connect(url.c_str())) {
-        ESP_LOGE(TAG, "Failed to connect to websocket server, code=%d", websocket_->GetLastError());
-        SetError(Lang::Strings::SERVER_NOT_CONNECTED);
-        return false;
-    }
-
+    // 连接已在 TryConnect() 中完成，直接发送 hello 消息
     // Send hello message to describe the client
     auto message = GetHelloMessage();
     if (!SendText(message)) {
@@ -226,8 +321,12 @@ std::string WebsocketProtocol::GetHelloMessage() {
 
 void WebsocketProtocol::ParseServerHello(const cJSON* root) {
     auto transport = cJSON_GetObjectItem(root, "transport");
-    if (transport == nullptr || strcmp(transport->valuestring, "websocket") != 0) {
-        ESP_LOGE(TAG, "Unsupported transport: %s", transport->valuestring);
+    if (transport == nullptr || !cJSON_IsString(transport)) {
+        ESP_LOGE(TAG, "transport字段缺失或无效");
+        return;
+    }
+    if (strcmp(transport->valuestring, "websocket") != 0) {
+        ESP_LOGE(TAG, "不支持的transport类型: %s", transport->valuestring);
         return;
     }
 
@@ -237,15 +336,28 @@ void WebsocketProtocol::ParseServerHello(const cJSON* root) {
         ESP_LOGI(TAG, "Session ID: %s", session_id_.c_str());
     }
 
+    // 解析音频参数并进行范围验证
     auto audio_params = cJSON_GetObjectItem(root, "audio_params");
     if (cJSON_IsObject(audio_params)) {
         auto sample_rate = cJSON_GetObjectItem(audio_params, "sample_rate");
         if (cJSON_IsNumber(sample_rate)) {
-            server_sample_rate_ = sample_rate->valueint;
+            int rate = sample_rate->valueint;
+            // 验证采样率范围: 8000-48000 Hz
+            if (rate >= 8000 && rate <= 48000) {
+                server_sample_rate_ = rate;
+            } else {
+                ESP_LOGW(TAG, "采样率超出有效范围(%d)，使用默认值", rate);
+            }
         }
         auto frame_duration = cJSON_GetObjectItem(audio_params, "frame_duration");
         if (cJSON_IsNumber(frame_duration)) {
-            server_frame_duration_ = frame_duration->valueint;
+            int duration = frame_duration->valueint;
+            // 验证帧时长范围: 10-120 ms (Opus 支持的范围)
+            if (duration >= 10 && duration <= 120) {
+                server_frame_duration_ = duration;
+            } else {
+                ESP_LOGW(TAG, "帧时长超出有效范围(%d)，使用默认值", duration);
+            }
         }
     }
 

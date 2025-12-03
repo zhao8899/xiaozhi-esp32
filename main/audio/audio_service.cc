@@ -267,6 +267,11 @@ void AudioService::AudioOutputTask() {
         auto task = std::move(audio_playback_queue_.front());
         audio_playback_queue_.pop_front();
         audio_queue_cv_.notify_all();
+
+#if CONFIG_USE_SERVER_AEC
+        // 保存 timestamp，在释放锁后使用
+        uint32_t timestamp = task->timestamp;
+#endif
         lock.unlock();
 
         if (!codec_->output_enabled()) {
@@ -282,9 +287,9 @@ void AudioService::AudioOutputTask() {
 
 #if CONFIG_USE_SERVER_AEC
         /* Record the timestamp for server AEC */
-        if (task->timestamp > 0) {
-            lock.lock();
-            timestamp_queue_.push_back(task->timestamp);
+        if (timestamp > 0) {
+            std::lock_guard<std::mutex> ts_lock(audio_queue_mutex_);
+            timestamp_queue_.push_back(timestamp);
         }
 #endif
     }
@@ -315,22 +320,28 @@ void AudioService::OpusCodecTask() {
             task->type = kAudioTaskTypeDecodeToPlaybackQueue;
             task->timestamp = packet->timestamp;
 
-            SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
-            if (opus_decoder_->Decode(std::move(packet->payload), task->pcm)) {
-                // Resample if the sample rate is different
-                if (opus_decoder_->sample_rate() != codec_->output_sample_rate()) {
-                    int target_size = output_resampler_.GetOutputSamples(task->pcm.size());
-                    std::vector<int16_t> resampled(target_size);
-                    output_resampler_.Process(task->pcm.data(), task->pcm.size(), resampled.data());
-                    task->pcm = std::move(resampled);
+            {
+                // 使用 codec_mutex_ 保护 opus_decoder_ 和 output_resampler_ 的访问
+                std::lock_guard<std::mutex> codec_lock(codec_mutex_);
+                SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
+                if (opus_decoder_->Decode(std::move(packet->payload), task->pcm)) {
+                    // Resample if the sample rate is different
+                    if (opus_decoder_->sample_rate() != codec_->output_sample_rate()) {
+                        int target_size = output_resampler_.GetOutputSamples(task->pcm.size());
+                        std::vector<int16_t> resampled(target_size);
+                        output_resampler_.Process(task->pcm.data(), task->pcm.size(), resampled.data());
+                        task->pcm = std::move(resampled);
+                    }
+                } else {
+                    ESP_LOGE(TAG, "Failed to decode audio");
+                    task.reset();  // 解码失败，清除任务
                 }
+            }
 
-                lock.lock();
+            lock.lock();
+            if (task) {
                 audio_playback_queue_.push_back(std::move(task));
                 audio_queue_cv_.notify_all();
-            } else {
-                ESP_LOGE(TAG, "Failed to decode audio");
-                lock.lock();
             }
             debug_statistics_.decode_count++;
         }
@@ -372,6 +383,7 @@ void AudioService::OpusCodecTask() {
 }
 
 void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
+    // 调用者必须持有 codec_mutex_
     if (opus_decoder_->sample_rate() == sample_rate && opus_decoder_->duration_ms() == frame_duration) {
         return;
     }
@@ -459,6 +471,8 @@ void AudioService::EnableWakeWordDetection(bool enable) {
 
     ESP_LOGD(TAG, "%s wake word detection", enable ? "Enabling" : "Disabling");
     if (enable) {
+        // 使用锁保护初始化检查和执行，防止 Check-Then-Act 竞态条件
+        std::lock_guard<std::mutex> lock(init_mutex_);
         if (!wake_word_initialized_) {
             if (!wake_word_->Initialize(codec_, models_list_)) {
                 ESP_LOGE(TAG, "Failed to initialize wake word");
@@ -477,6 +491,8 @@ void AudioService::EnableWakeWordDetection(bool enable) {
 void AudioService::EnableVoiceProcessing(bool enable) {
     ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
     if (enable) {
+        // 使用锁保护初始化检查和执行，防止 Check-Then-Act 竞态条件
+        std::lock_guard<std::mutex> lock(init_mutex_);
         if (!audio_processor_initialized_) {
             audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_);
             audio_processor_initialized_ = true;
@@ -508,11 +524,14 @@ void AudioService::EnableAudioTesting(bool enable) {
 
 void AudioService::EnableDeviceAec(bool enable) {
     ESP_LOGI(TAG, "%s device AEC", enable ? "Enabling" : "Disabling");
-    if (!audio_processor_initialized_) {
-        audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_);
-        audio_processor_initialized_ = true;
+    {
+        // 使用锁保护初始化检查和执行，防止 Check-Then-Act 竞态条件
+        std::lock_guard<std::mutex> lock(init_mutex_);
+        if (!audio_processor_initialized_) {
+            audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_);
+            audio_processor_initialized_ = true;
+        }
     }
-
     audio_processor_->EnableDeviceAec(enable);
 }
 
@@ -626,7 +645,10 @@ bool AudioService::IsIdle() {
 
 void AudioService::ResetDecoder() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    opus_decoder_->ResetState();
+    {
+        std::lock_guard<std::mutex> codec_lock(codec_mutex_);
+        opus_decoder_->ResetState();
+    }
     timestamp_queue_.clear();
     audio_decode_queue_.clear();
     audio_playback_queue_.clear();
